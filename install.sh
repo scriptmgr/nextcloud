@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # shellcheck shell=sh
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  YYYYMMDDHHMM-git
+##@Version           :  202605201933-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC1091,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="YYYYMMDDHHMM-git"
+VERSION="202605201933-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${USER:-root}"
@@ -991,6 +991,12 @@ __configure_nextcloud() {
 
   # Set maximum chunk size for uploads to avoid proxy timeouts.
   ${_occ_base} config:system:set max_chunk_size --value="0" --type=integer || true
+
+  # Set admin email to {admin_user}@{domain}. There is no env var for this;
+  # the Nextcloud image only sets the admin user and password at init time.
+  _occ_admin_email="${NEXTCLOUD_ADMIN_USER}@${NEXTCLOUD_DOMAIN:-localhost}"
+  ${_occ_base} user:setting "${NEXTCLOUD_ADMIN_USER}" settings email "${_occ_admin_email}" || true
+  __info "Admin email set to ${_occ_admin_email}."
 
   __info "Nextcloud occ configuration complete."
 }
