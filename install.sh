@@ -62,6 +62,7 @@ NEXTCLOUD_PHP_MEMORY="512M"
 NEXTCLOUD_PHP_UPLOAD="512M"
 NEXTCLOUD_NETWORK_NAME="nextcloud"
 NEXTCLOUD_UPDATE_ONLY="false"
+NEXTCLOUD_REMOVE="false"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Runtime state flags (not CLI-settable)
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -261,6 +262,7 @@ Options:
   --listen-addr IP            Host IP Docker binds the HTTP port to (default: 172.17.0.1)
                               172.17.0.1 is the Docker bridge gateway; reachable from host and containers.
   --update                    Pull latest images and recreate (with backup)
+  --remove                    Stop all containers, remove volumes, and delete the install directory
   -h, --help                  Show this help
   -v, --version               Show version and exit
 
@@ -438,6 +440,7 @@ __parse_args() {
             NEXTCLOUD_LISTEN_ADDR="${_optval}" ;;
 
           update)         NEXTCLOUD_UPDATE_ONLY="true" ;;
+          remove)         NEXTCLOUD_REMOVE="true" ;;
           yes|non-interactive) ;;  # kept for compatibility; script never prompts
 
           *) __err "Unknown option: --${OPTARG}"; exit 1 ;;
@@ -1095,10 +1098,36 @@ EOF
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
+# Remove (--remove): stop stack, drop volumes, delete install directory
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+__remove_stack() {
+  if [ ! -d "$NEXTCLOUD_PREFIX" ] && [ ! -f "$NEXTCLOUD_COMPOSE_FILE" ]; then
+    __warn "No installation found at $NEXTCLOUD_PREFIX — nothing to remove."
+    exit 0
+  fi
+
+  __step "Tearing down Nextcloud stack"
+  if [ -f "$NEXTCLOUD_COMPOSE_FILE" ]; then
+    cd "$NEXTCLOUD_COMPOSE_DIR"
+    docker compose down -v --remove-orphans 2>/dev/null || true
+  fi
+
+  __step "Removing install directory"
+  [ -n "$NEXTCLOUD_PREFIX" ] || { __err "NEXTCLOUD_PREFIX is empty — refusing to remove."; exit 1; }
+  rm -rf -- "$NEXTCLOUD_PREFIX"
+  __info "Removed $NEXTCLOUD_PREFIX"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
 # Main flow
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 __main() {
   printf "Nextcloud Installer %s\n" "$VERSION"
+
+  if [ "$NEXTCLOUD_REMOVE" = "true" ]; then
+    __remove_stack
+    exit 0
+  fi
 
   # Guard: --update on a path with no existing installation is almost always
   # a typo (wrong --path). Warn loudly so the user can abort.
