@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # shellcheck shell=sh
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202605201933-git
+##@Version           :  202605210034-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC1091,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202605201933-git"
+VERSION="202605210034-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${USER:-root}"
@@ -45,7 +45,8 @@ fi
 NEXTCLOUD_PREFIX="/opt/nextcloud"
 NEXTCLOUD_ADMIN_USER="administrator"
 NEXTCLOUD_ADMIN_PASS=""            # empty: loaded from .credentials or generated
-NEXTCLOUD_PORT="8080"
+NEXTCLOUD_PORT=""                  # empty: loaded from .credentials or randomly generated
+NEXTCLOUD_LISTEN_ADDR="172.17.0.1" # Docker bridge gateway — reachable from host and containers
 NEXTCLOUD_DOMAIN=""
 NEXTCLOUD_DB_NAME="nextcloud"
 NEXTCLOUD_DB_USER="nextcloud"
@@ -61,14 +62,21 @@ NEXTCLOUD_PHP_MEMORY="512M"
 NEXTCLOUD_PHP_UPLOAD="512M"
 NEXTCLOUD_NETWORK_NAME="nextcloud-net"
 NEXTCLOUD_UPDATE_ONLY="false"
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+# Runtime state flags (not CLI-settable)
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+_ADMIN_PASS_NEW="false"   # true when admin password is generated this run (not loaded)
+_PORT_EXPLICIT="false"    # true when --port was supplied on the command line
+_NGINX_VHOST_FILE=""      # path of nginx vhost written this run (empty if skipped)
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Helpers (POSIX)
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 __log()  { printf "%s\n" "$*"; }
-__info() { printf "[INFO] %s\n" "$*"; }
-__warn() { printf "[WARN] %s\n" "$*" >&2; }
-__err()  { printf "[ERR ] %s\n" "$*" >&2; }
+__info() { printf "  %s\n" "$*"; }
+__warn() { printf "  [WARN] %s\n" "$*" >&2; }
+__err()  { printf "  [ERR ] %s\n" "$*" >&2; }
+__step() { printf "\n==> %s\n" "$*"; }
 
 __need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { __err "Missing required command: $1"; exit 1; }
@@ -80,6 +88,12 @@ __need_cmd() {
 __random_password() {
   _rp_len="${1:-32}"
   tr -dc 'A-Za-z0-9!@#$%^&*_+-' </dev/urandom | head -c "${_rp_len}"
+}
+
+# Generate a random port in the 62000-64999 range (Docker proxy allocation range).
+# awk srand() seeds from time so each call yields a different value.
+__random_port() {
+  awk 'BEGIN { srand(); printf "%d\n", int(rand() * 3000) + 62000 }'
 }
 
 # Save key=value to a credentials file. Creates parent dirs and sets 600
@@ -99,8 +113,6 @@ __save_credential() {
     mv "$_sc_tmp" "$_sc_file"
   else
     printf '%s=%s\n' "$_sc_key" "$_sc_val" >> "$_sc_file"
-    printf 'Generated %s: %s\n' "$_sc_key" "$_sc_val"
-    printf 'Saved to: %s\n' "$_sc_file"
   fi
   chmod 600 "$_sc_file"
   if [ "$SET_UID" -eq 0 ]; then
@@ -222,7 +234,7 @@ Options:
   --path DIR, --prefix DIR    Install root (default: /opt/nextcloud)
   --admin-user NAME           Nextcloud admin username (default: administrator)
   --admin-pass PASS           Nextcloud admin password (default: random on first setup)
-  --port N                    Host port to bind (default: 8080)
+  --port N                    Host port to bind (default: random in 62000-64999, saved on first run)
   --domain HOST               Public hostname (auto-detected from hostname -f)
   --db-name NAME              MariaDB database name (default: nextcloud)
   --db-user USER              MariaDB database user (default: nextcloud)
@@ -239,6 +251,8 @@ Options:
   --network NAME              Docker network name (default: nextcloud-net)
                               Created automatically if it does not exist.
                               Join your reverse proxy to this network to reach Nextcloud.
+  --listen-addr IP            Host IP Docker binds the HTTP port to (default: 172.17.0.1)
+                              172.17.0.1 is the Docker bridge gateway; reachable from host and containers.
   --update                    Pull latest images and recreate (with backup)
   -h, --help                  Show this help
   -v, --version               Show version and exit
@@ -253,7 +267,7 @@ Notes:
     docker exec --user www-data nextcloud-app php occ user:resetpassword administrator
 
   Nextcloud runs behind a reverse proxy. Set --domain to the public hostname
-  your proxy forwards to this host. The stack listens on 127.0.0.1:PORT.
+  your proxy forwards to this host. The stack listens on 172.17.0.1:PORT.
 
   Access the administration panel at: https://DOMAIN/settings/admin
 
@@ -308,7 +322,8 @@ __parse_args() {
             eval "_optval=\${${_idx}:-}"
             [ -z "${_optval:-}" ] && { __err "Option --${OPTARG} requires a value."; exit 1; }
             case "${_optval}" in -*) __err "Option --${OPTARG} requires a value (got flag '${_optval}' instead)."; exit 1 ;; esac
-            NEXTCLOUD_PORT="${_optval}" ;;
+            NEXTCLOUD_PORT="${_optval}"
+            _PORT_EXPLICIT="true" ;;
 
           domain)
             _idx="$OPTIND"; OPTIND=$((OPTIND + 1))
@@ -408,6 +423,13 @@ __parse_args() {
             case "${_optval}" in -*) __err "Option --${OPTARG} requires a value (got flag '${_optval}' instead)."; exit 1 ;; esac
             NEXTCLOUD_NETWORK_NAME="${_optval}" ;;
 
+          listen-addr)
+            _idx="$OPTIND"; OPTIND=$((OPTIND + 1))
+            eval "_optval=\${${_idx}:-}"
+            [ -z "${_optval:-}" ] && { __err "Option --${OPTARG} requires a value."; exit 1; }
+            case "${_optval}" in -*) __err "Option --${OPTARG} requires a value (got flag '${_optval}' instead)."; exit 1 ;; esac
+            NEXTCLOUD_LISTEN_ADDR="${_optval}" ;;
+
           update)         NEXTCLOUD_UPDATE_ONLY="true" ;;
           yes|non-interactive) ;;  # kept for compatibility; script never prompts
 
@@ -441,13 +463,15 @@ if [ -z "$NEXTCLOUD_DOMAIN" ]; then
   fi
 fi
 
-# Validate --port: must be a positive integer in range 1-65535.
-case "$NEXTCLOUD_PORT" in
-  *[!0-9]*|'')
-    __err "--port must be a number between 1 and 65535 (got: '$NEXTCLOUD_PORT')."; exit 1 ;;
-esac
-if [ "$NEXTCLOUD_PORT" -lt 1 ] || [ "$NEXTCLOUD_PORT" -gt 65535 ]; then
-  __err "--port must be between 1 and 65535 (got: $NEXTCLOUD_PORT)."; exit 1
+# Validate --port when explicitly provided (not yet when empty; port is generated in __load_or_generate_credentials).
+if [ "$_PORT_EXPLICIT" = "true" ]; then
+  case "$NEXTCLOUD_PORT" in
+    *[!0-9]*|'')
+      __err "--port must be a number between 1 and 65535 (got: '$NEXTCLOUD_PORT')."; exit 1 ;;
+  esac
+  if [ "$NEXTCLOUD_PORT" -lt 1 ] || [ "$NEXTCLOUD_PORT" -gt 65535 ]; then
+    __err "--port must be between 1 and 65535 (got: $NEXTCLOUD_PORT)."; exit 1
+  fi
 fi
 
 # Validate --smtp-port: same 1-65535 range check as --port.
@@ -599,7 +623,6 @@ __install_docker_official() {
 
 __ensure_network() {
   if docker network inspect -- "$NEXTCLOUD_NETWORK_NAME" >/dev/null 2>&1; then
-    __info "Docker network '$NEXTCLOUD_NETWORK_NAME' already exists."
     return 0
   fi
   __info "Creating Docker network '$NEXTCLOUD_NETWORK_NAME'..."
@@ -611,17 +634,13 @@ __ensure_network() {
 }
 
 __ensure_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    __info "Docker is present."
-  else
+  if ! command -v docker >/dev/null 2>&1; then
     __info "Docker not found; installing from official repository..."
     __info "If automatic install fails, install docker-ce and docker-compose-plugin manually:"
     __info "  https://docs.docker.com/engine/install/"
     __install_docker_official
   fi
-  if docker compose version >/dev/null 2>&1; then
-    __info "Docker Compose v2 plugin present."
-  else
+  if ! docker compose version >/dev/null 2>&1; then
     __err "Docker Compose v2 plugin missing. Install docker-compose-plugin and re-run."; exit 1
   fi
 }
@@ -630,6 +649,16 @@ __ensure_docker() {
 # Credential management (load or generate; idempotent)
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 __load_or_generate_credentials() {
+  # Port: honour --port if explicitly provided; otherwise load from credentials or generate random.
+  if [ "$_PORT_EXPLICIT" = "true" ]; then
+    __save_credential "$NEXTCLOUD_CRED_FILE" NEXTCLOUD_PORT "$NEXTCLOUD_PORT"
+  else
+    NEXTCLOUD_PORT="$(__load_credential "$NEXTCLOUD_CRED_FILE" NEXTCLOUD_PORT 2>/dev/null)" || {
+      NEXTCLOUD_PORT="$(__random_port)"
+      __save_credential "$NEXTCLOUD_CRED_FILE" NEXTCLOUD_PORT "$NEXTCLOUD_PORT"
+    }
+  fi
+
   # Admin password: honour --admin-pass if provided; otherwise load or generate.
   if [ -n "$NEXTCLOUD_ADMIN_PASS" ]; then
     _admin_pass="$NEXTCLOUD_ADMIN_PASS"
@@ -638,6 +667,7 @@ __load_or_generate_credentials() {
     _admin_pass="$(__load_credential "$NEXTCLOUD_CRED_FILE" NEXTCLOUD_ADMIN_PASSWORD 2>/dev/null)" || {
       _admin_pass="$(__random_password 24)"
       __save_credential "$NEXTCLOUD_CRED_FILE" NEXTCLOUD_ADMIN_PASSWORD "$_admin_pass"
+      _ADMIN_PASS_NEW="true"
     }
   fi
 
@@ -693,6 +723,8 @@ NEXTCLOUD_DOCKER_IMAGE=nextcloud
 NEXTCLOUD_DOCKER_TAG=apache
 
 # --- Network ---
+# Host IP Docker binds the HTTP port to (172.17.0.1 = Docker bridge gateway).
+NEXTCLOUD_LISTEN_ADDR=$NEXTCLOUD_LISTEN_ADDR
 # Host port exposed by the reverse proxy.
 NEXTCLOUD_HTTP_PORT=$NEXTCLOUD_PORT
 # Public domain name.
@@ -739,7 +771,6 @@ NEXTCLOUD_LOG_DRIVER=local
 NEXTCLOUD_NETWORK=$NEXTCLOUD_NETWORK_NAME
 EOF
     chmod 600 "$NEXTCLOUD_ENV_FILE"
-    __info ".env written."
 
     if [ ! -s "$NEXTCLOUD_ADMIN_OUT" ]; then
       printf "Admin user    : %s\nAdmin pass    : %s\nAdmin URL     : %s://%s/settings/admin\nDB user       : %s\nDB pass       : %s\nDB name       : %s\n" \
@@ -747,10 +778,8 @@ EOF
         "$_nc_scheme" "${NEXTCLOUD_DOMAIN:-localhost}" \
         "$NEXTCLOUD_DB_USER" "$_db_pass" "$NEXTCLOUD_DB_NAME" > "$NEXTCLOUD_ADMIN_OUT"
       chmod 600 "$NEXTCLOUD_ADMIN_OUT"
-      __info "Admin credentials saved to $NEXTCLOUD_ADMIN_OUT"
     fi
   else
-    __info ".env exists; leaving as-is (idempotent)."
     if [ -n "$NEXTCLOUD_ADMIN_PASS" ]; then
       __warn "NEXTCLOUD_ADMIN_PASSWORD is ignored after first initialization."
       __warn "Reset the admin password with: docker exec --user www-data nextcloud-app php occ user:resetpassword $NEXTCLOUD_ADMIN_USER"
@@ -782,7 +811,7 @@ services:
       redis:
         condition: service_started
     ports:
-      - "127.0.0.1:${NEXTCLOUD_HTTP_PORT:-8080}:80"
+      - "${NEXTCLOUD_LISTEN_ADDR:-172.17.0.1}:${NEXTCLOUD_HTTP_PORT}:80"
     environment:
       NEXTCLOUD_ADMIN_USER: "${NEXTCLOUD_ADMIN_USER:-administrator}"
       NEXTCLOUD_ADMIN_PASSWORD: "${NEXTCLOUD_ADMIN_PASSWORD}"
@@ -926,10 +955,11 @@ __snapshot_backup() {
 # Wait for Nextcloud to complete installation
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 __wait_for_nextcloud() {
-  __info "Waiting for Nextcloud to initialize (can take a few minutes on first run)..."
+  __info "Waiting for Nextcloud to initialize (this may take a few minutes on first run)..."
+  _poll_addr="${NEXTCLOUD_LISTEN_ADDR:-172.17.0.1}"
   _tries=0
   while [ "$_tries" -lt 72 ]; do
-    _status="$(curl -q -LSs --max-time 5 "http://127.0.0.1:${NEXTCLOUD_PORT}/status.php" 2>/dev/null || true)"
+    _status="$(curl -q -LSs --max-time 5 "http://${_poll_addr}:${NEXTCLOUD_PORT}/status.php" 2>/dev/null || true)"
     if printf '%s' "$_status" | grep -q -- '"installed":true'; then
       __info "Nextcloud is installed and responding."
       return 0
@@ -946,8 +976,6 @@ __wait_for_nextcloud() {
 # Post-installation configuration via occ
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 __configure_nextcloud() {
-  __info "Configuring Nextcloud via occ..."
-
   # Determine scheme for overwrite URL.
   if [ -n "$NEXTCLOUD_DOMAIN" ] && [ "${NEXTCLOUD_DOMAIN%%.*}" != "$NEXTCLOUD_DOMAIN" ]; then
     _occ_scheme="https"
@@ -961,50 +989,128 @@ __configure_nextcloud() {
   # Set the canonical URL for CLI-generated links (e.g. share links, notifications).
   if [ -n "$NEXTCLOUD_DOMAIN" ]; then
     ${_occ_base} config:system:set overwrite.cli.url \
-      --value="${_occ_scheme}://${NEXTCLOUD_DOMAIN}/" || true
+      --value="${_occ_scheme}://${NEXTCLOUD_DOMAIN}/" >/dev/null 2>&1 || true
   fi
 
   # Tell Nextcloud the upstream protocol so it generates https:// links
   # even though Apache inside the container receives plain HTTP from the proxy.
   if [ "$_occ_scheme" = "https" ]; then
-    ${_occ_base} config:system:set overwriteprotocol --value="https" || true
+    ${_occ_base} config:system:set overwriteprotocol --value="https" >/dev/null 2>&1 || true
   fi
 
   # Trust all IPs as proxies so X-Forwarded-For and X-Forwarded-Proto
   # headers are honoured from any upstream reverse proxy.
-  ${_occ_base} config:system:set trusted_proxies 0 --value="0.0.0.0/0" || true
+  ${_occ_base} config:system:set trusted_proxies 0 --value="0.0.0.0/0" >/dev/null 2>&1 || true
 
   # Use APCu for local in-process caching (already available in the apache image).
-  ${_occ_base} config:system:set memcache.local --value='\OC\Memcache\APCu' || true
+  ${_occ_base} config:system:set memcache.local --value='\OC\Memcache\APCu' >/dev/null 2>&1 || true
 
   # Use Redis for distributed/locking cache.
-  ${_occ_base} config:system:set memcache.distributed --value='\OC\Memcache\Redis' || true
-  ${_occ_base} config:system:set memcache.locking --value='\OC\Memcache\Redis' || true
-  ${_occ_base} config:system:set redis host --value="redis" || true
-  ${_occ_base} config:system:set redis port --value="6379" --type=integer || true
+  ${_occ_base} config:system:set memcache.distributed --value='\OC\Memcache\Redis' >/dev/null 2>&1 || true
+  ${_occ_base} config:system:set memcache.locking --value='\OC\Memcache\Redis' >/dev/null 2>&1 || true
+  ${_occ_base} config:system:set redis host --value="redis" >/dev/null 2>&1 || true
+  ${_occ_base} config:system:set redis port --value="6379" --type=integer >/dev/null 2>&1 || true
 
   # Default phone region (used for phone number formatting in contacts).
-  ${_occ_base} config:system:set default_phone_region --value="US" || true
+  ${_occ_base} config:system:set default_phone_region --value="US" >/dev/null 2>&1 || true
 
   # Disable skeleton directory — new users start with an empty home folder.
-  ${_occ_base} config:system:set skeletondirectory --value="" || true
+  ${_occ_base} config:system:set skeletondirectory --value="" >/dev/null 2>&1 || true
 
   # Set maximum chunk size for uploads to avoid proxy timeouts.
-  ${_occ_base} config:system:set max_chunk_size --value="0" --type=integer || true
+  ${_occ_base} config:system:set max_chunk_size --value="0" --type=integer >/dev/null 2>&1 || true
 
-  # Set admin email to {admin_user}@{domain}. There is no env var for this;
-  # the Nextcloud image only sets the admin user and password at init time.
+  # Set admin email to {admin_user}@{domain}.
   _occ_admin_email="${NEXTCLOUD_ADMIN_USER}@${NEXTCLOUD_DOMAIN:-localhost}"
-  ${_occ_base} user:setting "${NEXTCLOUD_ADMIN_USER}" settings email "${_occ_admin_email}" || true
-  __info "Admin email set to ${_occ_admin_email}."
+  ${_occ_base} user:setting "${NEXTCLOUD_ADMIN_USER}" settings email "${_occ_admin_email}" >/dev/null 2>&1 || true
+}
 
-  __info "Nextcloud occ configuration complete."
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+# nginx vhost (created when nginx is installed and a valid FQDN domain is set)
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+__write_nginx_vhost() {
+  # Skip if domain is empty or single-label (local/no-TLS mode).
+  if [ -z "$NEXTCLOUD_DOMAIN" ] || [ "${NEXTCLOUD_DOMAIN%%.*}" = "$NEXTCLOUD_DOMAIN" ]; then
+    return 0
+  fi
+  # Skip if nginx is not installed.
+  if ! command -v nginx >/dev/null 2>&1; then
+    return 0
+  fi
+
+  _vhost_dir="/etc/nginx/vhosts.d"
+  _vhost_file="${_vhost_dir}/${NEXTCLOUD_DOMAIN}.conf"
+
+  # Skip if the file already exists and contains our marker.
+  if [ -f "$_vhost_file" ] && grep -q -- "# reverse proxy for ${NEXTCLOUD_DOMAIN}" "$_vhost_file"; then
+    return 0
+  fi
+
+  mkdir -p "$_vhost_dir"
+
+  _vhost_tmp="$(mktemp)"
+  cat > "$_vhost_tmp" <<EOF
+# reverse proxy for ${NEXTCLOUD_DOMAIN}
+# Generated by nextcloud install.sh — customise as needed.
+server {
+    listen      80;
+    server_name ${NEXTCLOUD_DOMAIN};
+
+    # Redirect all plain-HTTP traffic to HTTPS.
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen      443 ssl;
+    http2       on;
+    server_name ${NEXTCLOUD_DOMAIN};
+
+    # SSL — set your certificate paths or run:
+    #   certbot --nginx -d ${NEXTCLOUD_DOMAIN}
+    # ssl_certificate     /etc/ssl/certs/${NEXTCLOUD_DOMAIN}.crt;
+    # ssl_certificate_key /etc/ssl/private/${NEXTCLOUD_DOMAIN}.key;
+
+    client_max_body_size ${NEXTCLOUD_PHP_UPLOAD:-512M};
+    client_body_timeout  300s;
+    proxy_read_timeout   300s;
+
+    add_header Strict-Transport-Security "max-age=15768000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options    nosniff                                         always;
+    add_header X-Frame-Options           SAMEORIGIN                                      always;
+    add_header X-XSS-Protection          "1; mode=block"                                 always;
+    add_header Referrer-Policy           no-referrer                                     always;
+
+    location / {
+        proxy_pass         http://${NEXTCLOUD_LISTEN_ADDR}:${NEXTCLOUD_PORT};
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   X-Forwarded-Host  \$host;
+        proxy_set_header   X-Forwarded-Port  \$server_port;
+        proxy_buffering    off;
+    }
+}
+EOF
+
+  mv "$_vhost_tmp" "$_vhost_file"
+  chmod 644 "$_vhost_file"
+  _NGINX_VHOST_FILE="$_vhost_file"
+
+  # Test nginx config and reload gracefully if valid.
+  if nginx -t >/dev/null 2>&1; then
+    nginx -s reload >/dev/null 2>&1 || true
+  else
+    __warn "nginx -t failed after writing vhost; check ${_vhost_file} before reloading nginx."
+  fi
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Main flow
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 __main() {
+  printf "Nextcloud Installer %s\n" "$VERSION"
+
   # Guard: --update on a path with no existing installation is almost always
   # a typo (wrong --path). Warn loudly so the user can abort.
   if [ "$NEXTCLOUD_UPDATE_ONLY" = "true" ] && [ ! -f "$NEXTCLOUD_ENV_FILE" ]; then
@@ -1013,30 +1119,35 @@ __main() {
     sleep 3
   fi
 
+  __step "Checking prerequisites"
   __ensure_docker
+
+  __step "Setting up network"
   __ensure_network
+
+  __step "Loading credentials"
   __load_or_generate_credentials
+
+  __step "Writing configuration"
   __write_env_file
   __write_compose_file
 
   cd "$NEXTCLOUD_COMPOSE_DIR"
 
   if [ "$NEXTCLOUD_UPDATE_ONLY" = "true" ]; then
-    __info "Running update flow..."
+    __step "Updating Nextcloud stack"
     __snapshot_backup
-    __info "Putting Nextcloud in maintenance mode..."
-    docker exec --user www-data nextcloud-app php occ maintenance:mode --on 2>/dev/null || true
+    docker exec --user www-data nextcloud-app php occ maintenance:mode --on >/dev/null 2>&1 || true
     __info "Pulling latest images..."
     docker compose pull
     __info "Recreating services..."
     docker compose up -d --remove-orphans
-    __info "Taking Nextcloud out of maintenance mode..."
     sleep 10
-    docker exec --user www-data nextcloud-app php occ maintenance:mode --off 2>/dev/null || true
-    docker exec --user www-data nextcloud-app php occ upgrade 2>/dev/null || true
-    docker exec --user www-data nextcloud-app php occ app:update --all 2>/dev/null || true
+    docker exec --user www-data nextcloud-app php occ maintenance:mode --off >/dev/null 2>&1 || true
+    docker exec --user www-data nextcloud-app php occ upgrade >/dev/null 2>&1 || true
+    docker exec --user www-data nextcloud-app php occ app:update --all >/dev/null 2>&1 || true
   else
-    __info "Bringing up Nextcloud stack..."
+    __step "Starting Nextcloud stack"
     docker compose up -d
   fi
 
@@ -1044,56 +1155,48 @@ __main() {
   __wait_for_nextcloud || _nc_up=false
 
   if [ "$_nc_up" = "true" ] && [ "$NEXTCLOUD_UPDATE_ONLY" = "false" ]; then
+    __step "Applying Nextcloud configuration"
     __configure_nextcloud
   fi
 
-  # Read domain/port from existing .env when not supplied on the command line,
-  # so the summary reflects the actual configured values.
-  if [ -f "$NEXTCLOUD_ENV_FILE" ]; then
-    if [ -z "$NEXTCLOUD_DOMAIN" ]; then
-      _env_domain="$(sed -n 's/^NEXTCLOUD_DOMAIN="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$NEXTCLOUD_ENV_FILE")"
-      if [ -n "$_env_domain" ] && [ "$_env_domain" != "localhost" ]; then
-        NEXTCLOUD_DOMAIN="$_env_domain"
-      fi
-    fi
-    _env_port="$(sed -n 's/^NEXTCLOUD_HTTP_PORT="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$NEXTCLOUD_ENV_FILE")"
-    if [ -n "$_env_port" ]; then
-      NEXTCLOUD_PORT="$_env_port"
-    fi
-  fi
+  __step "Writing nginx vhost"
+  __write_nginx_vhost
 
-  # Derive display scheme from domain (mirrors __write_env_file logic).
+  # Derive display scheme from domain.
   if [ -z "$NEXTCLOUD_DOMAIN" ] || [ "${NEXTCLOUD_DOMAIN%%.*}" = "$NEXTCLOUD_DOMAIN" ]; then
     _sum_scheme="http"
   else
     _sum_scheme="https"
   fi
 
-  __info ""
+  printf "\n"
+  printf "══════════════════════════════════════════════════════════════\n"
   if [ "$_nc_up" = "true" ]; then
-    __info "Nextcloud is up. Summary:"
+    printf " Nextcloud is running\n"
   else
-    __warn "Nextcloud did not come up within the timeout. Summary (check logs above):"
+    printf " Nextcloud stack started — initialization may still be in progress\n"
+    printf " Check logs: docker compose -f %s/compose.yaml logs -f nextcloud\n" "$NEXTCLOUD_COMPOSE_DIR"
   fi
-  __info "  Compose dir   : $NEXTCLOUD_COMPOSE_DIR"
-  __info "  Port (HTTP)   : 127.0.0.1:$NEXTCLOUD_PORT  (attach your reverse proxy)"
-  __info "  Docker network: $NEXTCLOUD_NETWORK_NAME  (attach your reverse proxy here)"
+  printf "══════════════════════════════════════════════════════════════\n"
   if [ -n "$NEXTCLOUD_DOMAIN" ]; then
-    __info "  Public URL    : ${_sum_scheme}://$NEXTCLOUD_DOMAIN/"
-    __info "  Admin panel   : ${_sum_scheme}://$NEXTCLOUD_DOMAIN/settings/admin"
+    printf "  URL          : %s://%s/\n"              "$_sum_scheme" "$NEXTCLOUD_DOMAIN"
+    printf "  Admin panel  : %s://%s/settings/admin\n" "$_sum_scheme" "$NEXTCLOUD_DOMAIN"
   fi
-  if [ -f "$NEXTCLOUD_ADMIN_OUT" ]; then
-    __info "  Admin creds   : $NEXTCLOUD_ADMIN_OUT  (delete after noting; mode 600)"
+  printf "  Admin user   : %s\n" "$NEXTCLOUD_ADMIN_USER"
+  if [ "$_ADMIN_PASS_NEW" = "true" ]; then
+    printf "  Admin pass   : %s  ← shown once; save it now\n" "$_admin_pass"
   fi
-  __info "  Credentials   : $NEXTCLOUD_CRED_FILE  (mode 600)"
-  __info "  Data dir      : $NEXTCLOUD_DATA_DIR"
-  __info "  DB dir        : $NEXTCLOUD_DB_DIR"
-  __info "  Backups       : $NEXTCLOUD_BACKUP_DIR"
-  __info ""
-  __info "To manage:"
-  __info "  cd $NEXTCLOUD_COMPOSE_DIR && docker compose ps"
-  __info "  cd $NEXTCLOUD_COMPOSE_DIR && docker compose logs -f nextcloud"
-  __info "  sh install.sh --update --path $NEXTCLOUD_COMPOSE_DIR"
+  printf "  Proxy bind   : %s:%s\n" "$NEXTCLOUD_LISTEN_ADDR" "$NEXTCLOUD_PORT"
+  printf "  Network      : %s\n"   "$NEXTCLOUD_NETWORK_NAME"
+  if [ -n "$_NGINX_VHOST_FILE" ]; then
+    printf "  Nginx vhost  : %s\n" "$_NGINX_VHOST_FILE"
+  fi
+  printf "  Install dir  : %s\n" "$NEXTCLOUD_COMPOSE_DIR"
+  printf "  Credentials  : %s  (mode 600)\n" "$NEXTCLOUD_CRED_FILE"
+  printf "\n"
+  printf "  Manage : cd %s && docker compose ps\n" "$NEXTCLOUD_COMPOSE_DIR"
+  printf "  Update : sh install.sh --update --path %s\n" "$NEXTCLOUD_COMPOSE_DIR"
+  printf "══════════════════════════════════════════════════════════════\n"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
