@@ -211,14 +211,14 @@ __determine_hostname_name() {
 # Returns the runtime domain name. Tries hostname -d first; falls back to
 # stripping the first label from hostname -f. Returns 1 if both fail.
 __determine_domain_name() {
-	_domain="$(hostname -d 2>/dev/null | grep -v -- '(none)')"
-	if [ -n "$_domain" ]; then
-		printf '%s\n' "$_domain"
+	_ddn_domain="$(hostname -d 2>/dev/null | grep -v -- '(none)')"
+	if [ -n "$_ddn_domain" ]; then
+		printf '%s\n' "$_ddn_domain"
 		return 0
 	fi
-	_fqdn="$(hostname -f 2>/dev/null)"
-	if [ -n "$_fqdn" ] && [ "$_fqdn" != "${_fqdn#*.}" ]; then
-		printf '%s\n' "${_fqdn#*.}"
+	_ddn_fqdn="$(hostname -f 2>/dev/null)"
+	if [ -n "$_ddn_fqdn" ] && [ "$_ddn_fqdn" != "${_ddn_fqdn#*.}" ]; then
+		printf '%s\n' "${_ddn_fqdn#*.}"
 		return 0
 	fi
 	return 1
