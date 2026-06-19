@@ -218,8 +218,11 @@ __determine_domain_name() {
 	fi
 	_ddn_fqdn="$(hostname -f 2>/dev/null)"
 	if [ -n "$_ddn_fqdn" ] && [ "$_ddn_fqdn" != "${_ddn_fqdn#*.}" ]; then
-		printf '%s\n' "${_ddn_fqdn#*.}"
-		return 0
+		_ddn_stripped="${_ddn_fqdn#*.}"
+		case "$_ddn_stripped" in
+			local|localdomain|localhost|localdomain.localdomain) ;;
+			*) printf '%s\n' "$_ddn_stripped"; return 0 ;;
+		esac
 	fi
 	return 1
 }
