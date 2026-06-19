@@ -211,7 +211,7 @@ __determine_hostname_name() {
 # Returns the runtime domain name. Tries hostname -d first; falls back to
 # stripping the first label from hostname -f. Returns 1 if both fail.
 __determine_domain_name() {
-	_domain="$(hostname -d 2>/dev/null | grep -v '(none)')"
+	_domain="$(hostname -d 2>/dev/null | grep -v -- '(none)')"
 	if [ -n "$_domain" ]; then
 		printf '%s\n' "$_domain"
 		return 0
@@ -1193,7 +1193,7 @@ services:
       PHP_MEMORY_LIMIT: "${NEXTCLOUD_PHP_MEMORY:-512M}"
       PHP_UPLOAD_LIMIT: "${NEXTCLOUD_PHP_UPLOAD:-512M}"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost/status.php | grep -q '\"installed\":true'"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost/status.php | grep -q -- '\"installed\":true'"]
       interval: 30s
       timeout: 10s
       retries: 10
